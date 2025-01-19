@@ -1,0 +1,10 @@
+[package]
+name = "gcs-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.26"
+reqwest = "0.12.12"
+serde = "1.0.217"
+tokio = { version = "1.43.0", features = ["full"] }

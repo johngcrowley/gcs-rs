@@ -10,6 +10,7 @@ pub mod http {
             .about("A rust-based, barebones GCS client based on Google Cloud HTTP API")
             .arg(arg!(--op <VALUE>).required(true))
             .arg(arg!(--uri <VALUE>).required(true))
+            .arg(arg!(--xml ... "Use XML API"))
             .get_matches();
 
         println!(
@@ -49,12 +50,22 @@ async fn main() -> Result<(), reqwest::Error> {
     ///   "https://iam.googleapis.com/v1/projects/PROJECT_ID/serviceAccounts"
     ///
     ///   
-    // Basic request
-    let res = reqwest::get(uri).await?;
-    println!("Status: {}", res.status());
-    println!("Headers:\n{:#?}", res.headers());
-    let body = res.text().await?;
-    println!("Body:\n{}", body);
+    match matches.get_one::<u8>("xml").expect("Counts are defaulted") {
+        0 => {
+            println!("JSON API selected");
 
+            // Basic request (JSON API)
+            let res = reqwest::get(uri).await?;
+            println!("Status: {}", res.status());
+            println!("Headers:\n{:#?}", res.headers());
+            let body = res.text().await?;
+            println!("Body:\n{}", body);
+        }
+        _ => {
+            println!("XML API selected");
+            // TODO
+            // https://users.rust-lang.org/t/post-request-with-xml-payload-via-reqwest/64295
+        }
+    }
     Ok(())
 }

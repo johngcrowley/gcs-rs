@@ -1,21 +1,23 @@
 # GCS Client in Rust 
 
 ```
-./gcs-rs --op list --uri https://storage.googleapis.com/storage/v1/b/<BUCKET>/o/
+cargo run -- --op whatever --uri whatever
 ```
+- For now, `--op` and `--uri` values are hardcoded for early development.
 
-My goal is to get `batch` endpoints working (upload, delete).
+### Goals
+- [] List -- single, no pagination
+- [] Upload
+- [] Delete
 
-Cloud storage authentication API [docs](https://cloud.google.com/storage/docs/authentication#apiauth) state that the XML API uses HMAC keys in addition,
-but the JSON API _only_ allows OAuth 2.0 tokens. I don't feel like running `$(gloud auth access-token-print)` each time to pass the Bearer token.
-
-People seem to like [quick-xml](https://github.com/tafia/quick-xml?tab=readme-ov-file) and it implements bits of `Serde`.
-
-# JSON `list objects`
-
+**`list`**
 - [docs](https://cloud.google.com/storage/docs/json_api/v1/objects/list)
 
-# XML `list objects`
+**`upload`**
+- [docs](https://cloud.google.com/storage/docs/resumable-uploads#rest-apis)
+```
+The Cloud Storage JSON API uses a POST Object request that includes the query parameter uploadType=resumable to initiate the resumable upload. This request returns as session URI that you then use in one or more PUT Object requests to upload the object data. For a step-by-step guide to building your own logic for resumable uploading, see Performing resumable uploads.
+```
 
-- [docs](https://cloud.google.com/storage/docs/xml-api/get-bucket-list)
+
 

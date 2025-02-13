@@ -5,6 +5,8 @@ use anyhow::{Error, Result};
 use gcp_auth::{Token, TokenProvider};
 use http::Method;
 use reqwest::{header, Client};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap as Map;
 use std::sync::Arc;
 
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
@@ -30,18 +32,41 @@ pub mod ops {
 
     use super::*;
 
-    pub async fn list(gcs_uri: &'static str, token: Arc<Token>) -> Result<()> {
+    pub async fn list(token_provider: Arc<dyn TokenProvider>) -> Result<()> {
+        // AWS S3 SDK for Rust has a ListObjectsV2 call on the Client.
+        // It returns a ListObjectsV2FluentBuilder, which has `.send()` impld on it.
+        // That `.send()` returns a Result<ListObjectsV2Output, SDKError>
+        // the ListObjectsV2Output is a struct like my `GCSListResponse` that parses the fields of
+        // the response.
+        // https://github.com/awslabs/aws-sdk-rust/blob/main/sdk/s3/src/operation/list_objects_v2/_list_objects_v2_output.rs#L5
+        // ---
+        // Here is how the `client.list_objects_v2().send()` gets used (records are fetched):
+        // https://github.com/awslabs/aws-sdk-rust/blob/main/examples/examples/s3/src/bin/list-objects.rs#L27
+        // ---
+        // `res.contents()` is an iterator (Vec) of Option<Object> and Object has a `.key()`.
+        // ---
+        // So my GCSListReponse should be the parent Vec, and each item in it the
+        // ListResponseObject, which should impl an interface similar to that.
+
+        let gcs_uri: &'static str =
+            "https://storage.googleapis.com/storage/v1/b/acrelab-production-us1c-transfer/o?prefix=bourdain/xray/parcel/one/cdl/json";
+
         let res = Client::new()
             .get(gcs_uri)
-            .bearer_auth(token.as_str())
+            .bearer_auth(token_provider.token(SCOPES).await?.as_str())
             .send()
             .await?;
 
-        println!("Status: {}", res.status());
-        println!("Headers:\n{:#?}", res.headers());
-
+        //println!("Status: {}", res.status());
+        //println!("Headers:\n{:#?}", res.headers());
         let body = res.text().await?;
         println!("Body:\n{}", body);
+
+        let resp: types::GCSListResponse = serde_json::from_str(&body)?;
+
+        for res in resp.contents() {
+            println!("{:?}", res);
+        }
 
         Ok(())
     }
@@ -61,41 +86,11 @@ pub mod ops {
 
         println!("Status: {}", res.status());
         println!("Headers:\n{:#?}", res.headers());
-
         let body = res.text().await?;
         println!("Body:\n{}", body);
 
         Ok(())
     }
-
-    // TODO
-    /// Currently, I have to do dynamic dispatch because TokenProvider is a trait, not a concrete type.
-    ///
-    /// But, I'm using
-    /// [CustomServiceAccount](https://docs.rs/gcp_auth/latest/src/gcp_auth/custom_service_account.rs.html#130)
-    /// concrete type (from `gcp_auth` crate), so i don't really need dynamic dispatch.
-    ///
-    /// I also don't have to worry about code bloat with monomorphization because I'm only ever going to
-    /// use 'CustomServiceAccount' concrete type, so I can choose to use Generics here as my
-    /// solution.
-    ///
-    /// Instead of passing around an Arc< dyn ...>, I can make a struct like
-    ///
-    /// struct HttpClient<T: TokenProvider> {
-    ///     token_provider: Arc<T>
-    /// }
-    ///
-    /// and then
-    ///
-    /// impl<T: TokenProvider> for HttpClient<T> {
-    ///     fn upload {}
-    ///     fn download {}
-    /// }
-    ///
-    /// etc, where that will compile down to just 'CustomServiceAccount'. Now, I'm not getting a
-    /// run-time cost, and I'm getting to pass around ownership, and I'm getting to call my
-    /// `.token()` method for refresh logic.
-    ///
 
     pub async fn get_resumable_upload_uri(
         token_provider: Arc<dyn TokenProvider>,
@@ -121,6 +116,10 @@ pub mod ops {
             .send()
             .await?;
 
+        println!("---- uri for resumable upload -----");
+        println!("Status: {}", res.status());
+        println!("Headers:\n{:#?}", res.headers());
+
         let uri = res
             .headers()
             .get("location")
@@ -134,34 +133,107 @@ pub mod ops {
         token_provider: Arc<dyn TokenProvider>,
         file: String,
     ) -> Result<()> {
-        // -- Get URI for resumable uploads --
-        ///
-        // Interesting error I had gotten when method-chaining `to_str()` to be a one-liner:
-        //----------------------------------------------------------------------------------------------
-        //                    "temporary value dropped while borrowed"
-        //----------------------------------------------------------------------------------------------
-        // The owned value of type `HeaderValue` which returns from `get_resumable_upload_uri()`
-        // never made a pointer back to this stack frame (function). It's arm was groping from the
-        // pit, but fell, limply. The `to_str()` turned it's owned value return into a reference,
-        // which was dangling back to the stack frame it just exited. Thus, I must `let uri` BE
-        // `uri`. Then, from this stack frame, I may play with it.
         let uri = get_resumable_upload_uri(Arc::clone(&token_provider), file.clone()).await?;
 
-        // PUT Chunk
-        let data_binary = std::fs::read(&file).expect("File path doesn't exist");
-        let data_bytes = std::fs::metadata(&file)
-            .expect("File path doesn't exist")
-            .len();
+        /// Keep trying this 'uri' until it 4xx's -> restart this session
+        /// Check chunk's status -> if complete, move on, elif 'range' header, resume, else, start
+        /// new?
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            header::HeaderValue::from_static("bytes */*"),
+        );
+        headers.insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_static("0"),
+        );
 
         let res = Client::new()
             .put(uri.to_str()?)
-            .body(data_binary)
-            .header(header::CONTENT_LENGTH, data_bytes)
+            .headers(headers)
             .bearer_auth(token_provider.token(SCOPES).await?.as_str())
             .send()
             .await?;
 
+        println!("{:?}", res);
+        println!("---- status of resumable upload -----");
+        println!("Status: {}", res.status());
+        println!("Headers:\n{:#?}", res.headers());
+
+        //// PUT Chunk
+        //let data_binary = std::fs::read(&file).expect("File path doesn't exist");
+        //let data_bytes = std::fs::metadata(&file)
+        //    .expect("File path doesn't exist")
+        //    .len();
+
+        //let res = Client::new()
+        //    .put(uri.to_str()?)
+        //    .body(data_binary)
+        //    .header(header::CONTENT_LENGTH, data_bytes)
+        //    .bearer_auth(token_provider.token(SCOPES).await?.as_str())
+        //    .send()
+        //    .await?;
+
+        //println!("---- resumable upload -----");
+        //println!("Status: {}", res.status().is_success());
+        //println!("Headers:\n{:#?}", res.headers());
+
         Ok(())
+    }
+
+    pub mod types {
+
+        use super::*;
+
+        #[derive(Serialize, Deserialize, Debug)]
+        pub struct GCSListResponse {
+            items: Option<Vec<GCSObject>>,
+        }
+
+        #[derive(Serialize, Deserialize, Debug)]
+        #[serde(rename_all = "snake_case")]
+        pub struct GCSObject {
+            name: String,
+            bucket: String,
+            generation: String,
+            metageneration: String,
+            #[serde(rename = "contentType")]
+            content_type: String,
+            #[serde(rename = "storageClass")]
+            storage_class: String,
+            size: String,
+            #[serde(rename = "md5Hash")]
+            md5_hash: String,
+            crc32c: String,
+            etag: String,
+            #[serde(rename = "timeCreated")]
+            time_created: String,
+            updated: String,
+            #[serde(rename = "timeStorageClassUpdated")]
+            time_storage_class_updated: String,
+            #[serde(rename = "timeFinalized")]
+            time_finalized: String,
+            metadata: Map<String, String>,
+        }
+
+        impl GCSListResponse {
+            pub fn contents(&self) -> &[GCSObject] {
+                self.items.as_deref().unwrap_or_default()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+
+        use super::*;
+        //use gcp_auth;
+
+        #[tokio::test]
+        async fn list_object_returns_paths() {
+            let provider = gcp_auth::provider().await.unwrap();
+            list(Arc::clone(&provider)).await;
+        }
     }
 }
 
@@ -182,13 +254,13 @@ async fn main() -> Result<()> {
     //println!("{}", token.as_str());
 
     // -- List bucket --
-    //list(Arc::clone(&token)).await?;
+    list(Arc::clone(&provider)).await?;
 
     // -- Upload object --
     //upload(Arc::clone(&token), "./foo.txt".to_owned()).await?;
 
     // -- Resumably Upload objects --
-    resumable_upload(Arc::clone(&provider), "./foo.txt".to_owned()).await?;
+    //resumable_upload(Arc::clone(&provider), "./foo.txt".to_owned()).await?;
 
     Ok(())
 }

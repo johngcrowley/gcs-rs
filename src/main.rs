@@ -8,6 +8,7 @@ use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap as Map;
 use std::sync::Arc;
+use tokio_util::codec::{BytesCodec, FramedRead};
 
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
 
@@ -71,112 +72,47 @@ pub mod ops {
         Ok(())
     }
 
-    pub async fn upload(token: Arc<Token>, file: String) -> Result<()> {
+    pub async fn upload(token_provider: Arc<dyn TokenProvider>, file: String) -> Result<()> {
+        // upload foo.txt for now
         let gcs_uri: &'static str =
             "https://storage.googleapis.com/upload/storage/v1/b/acrelab-production-us1c-transfer/o?uploadType=media&name=foo.txt";
 
-        let data_binary = std::fs::read(file).expect("File path doesn't exist");
-
-        let res = Client::new()
-            .post(gcs_uri)
-            .body(data_binary)
-            .bearer_auth(token.as_str())
-            .send()
-            .await?;
-
-        println!("Status: {}", res.status());
-        println!("Headers:\n{:#?}", res.headers());
-        let body = res.text().await?;
-        println!("Body:\n{}", body);
-
-        Ok(())
-    }
-
-    pub async fn get_resumable_upload_uri(
-        token_provider: Arc<dyn TokenProvider>,
-        file: String,
-    ) -> Result<header::HeaderValue, anyhow::Error> {
-        let gcs_uri: &'static str =
-            "https://storage.googleapis.com/upload/storage/v1/b/acrelab-production-us1c-transfer/o?uploadType=resumable&name=foo.txt";
-
+        // https://cloud.google.com/storage/docs/xml-api/reference-headers#chunked
         let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            header::HeaderValue::from_static("chunked"),
+        );
         headers.insert(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
-        headers.insert(
-            header::CONTENT_LENGTH,
-            header::HeaderValue::from_static("0"),
-        );
+        // read from file system into Stream of bytes
+        // ---
+        // https://docs.rs/tokio-util/latest/tokio_util/codec/struct.BytesCodec.html
+        // ---
+        // "codec" = portmaneau of coder/decoder. handles a data stream.
+        let async_read = tokio::fs::File::open("./foo.txt").await?;
+        let stream = FramedRead::new(async_read, BytesCodec::new());
 
+        // https://docs.rs/tokio-util/latest/tokio_util/codec/index.html
+        // https://cloud.google.com/storage/docs/uploading-objects
+        // https://docs.rs/reqwest/latest/reqwest/struct.Body.html#method.wrap_stream
+        // https://gist.github.com/Ciantic/aa97c7a72f8356d7980756c819563566
         let res = Client::new()
             .post(gcs_uri)
+            .body(reqwest::Body::wrap_stream(stream))
             .headers(headers)
             .bearer_auth(token_provider.token(SCOPES).await?.as_str())
             .send()
             .await?;
 
-        println!("---- uri for resumable upload -----");
+        println!("---- streaming upload -----");
         println!("Status: {}", res.status());
         println!("Headers:\n{:#?}", res.headers());
 
-        let uri = res
-            .headers()
-            .get("location")
-            .ok_or_else(|| anyhow::anyhow!("Missing 'location' in header"))?
-            .clone();
-
-        Ok(uri)
-    }
-
-    pub async fn resumable_upload(
-        token_provider: Arc<dyn TokenProvider>,
-        file: String,
-    ) -> Result<()> {
-        let uri = get_resumable_upload_uri(Arc::clone(&token_provider), file.clone()).await?;
-
-        /// Keep trying this 'uri' until it 4xx's -> restart this session
-        /// Check chunk's status -> if complete, move on, elif 'range' header, resume, else, start
-        /// new?
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::CONTENT_RANGE,
-            header::HeaderValue::from_static("bytes */*"),
-        );
-        headers.insert(
-            header::CONTENT_LENGTH,
-            header::HeaderValue::from_static("0"),
-        );
-
-        let res = Client::new()
-            .put(uri.to_str()?)
-            .headers(headers)
-            .bearer_auth(token_provider.token(SCOPES).await?.as_str())
-            .send()
-            .await?;
-
-        println!("{:?}", res);
-        println!("---- status of resumable upload -----");
-        println!("Status: {}", res.status());
-        println!("Headers:\n{:#?}", res.headers());
-
-        //// PUT Chunk
-        //let data_binary = std::fs::read(&file).expect("File path doesn't exist");
-        //let data_bytes = std::fs::metadata(&file)
-        //    .expect("File path doesn't exist")
-        //    .len();
-
-        //let res = Client::new()
-        //    .put(uri.to_str()?)
-        //    .body(data_binary)
-        //    .header(header::CONTENT_LENGTH, data_bytes)
-        //    .bearer_auth(token_provider.token(SCOPES).await?.as_str())
-        //    .send()
-        //    .await?;
-
-        //println!("---- resumable upload -----");
-        //println!("Status: {}", res.status().is_success());
-        //println!("Headers:\n{:#?}", res.headers());
+        let body = res.text().await?;
+        println!("Body:\n{}", body);
 
         Ok(())
     }
@@ -240,7 +176,7 @@ pub mod ops {
 #[tokio::main]
 async fn main() -> Result<()> {
     use cli::parse_args;
-    use ops::{get_resumable_upload_uri, list, resumable_upload, upload};
+    use ops::{list, upload};
 
     // TODO  CLI Arguments
     let matches = parse_args();
@@ -254,13 +190,13 @@ async fn main() -> Result<()> {
     //println!("{}", token.as_str());
 
     // -- List bucket --
-    list(Arc::clone(&provider)).await?;
+    //list(Arc::clone(&provider)).await?;
 
     // -- Upload object --
-    //upload(Arc::clone(&token), "./foo.txt".to_owned()).await?;
+    upload(Arc::clone(&provider), "./foo.txt".to_owned()).await?;
 
     // -- Resumably Upload objects --
-    //resumable_upload(Arc::clone(&provider), "./foo.txt".to_owned()).await?;
+    //upload(Arc::clone(&provider), "./foo.txt".to_owned()).await?;
 
     Ok(())
 }

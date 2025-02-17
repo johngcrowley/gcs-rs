@@ -31,9 +31,13 @@ pub mod cli {
 
 pub mod ops {
 
-    use super::*;
+    use std::io::BufReader;
 
+    use super::*;
+    // https://gist.github.com/DmitrySoshnikov/2027a83bab8f00196d2ec295db1a40a8
     pub async fn list(token_provider: Arc<dyn TokenProvider>) -> Result<()> {
+        // Client:
+        // ----------------------------------
         // AWS S3 SDK for Rust has a ListObjectsV2 call on the Client.
         // It returns a ListObjectsV2FluentBuilder, which has `.send()` impld on it.
         // That `.send()` returns a Result<ListObjectsV2Output, SDKError>
@@ -48,6 +52,13 @@ pub mod ops {
         // ---
         // So my GCSListReponse should be the parent Vec, and each item in it the
         // ListResponseObject, which should impl an interface similar to that.
+        //
+        // Neon:
+        // ----------------------------------
+        // https://github.com/neondatabase/neon/blob/8c2f85b20922c9c32d255da6b0b362b7b323eb82/libs/remote_storage/src/s3_bucket.rs#L494C4-L499C36
+        // We care about 'key', 'last_modified', and 'size'
+        // ---
+        // We take in a "mode", "max_keys", "cancel (token)", and "Option<prefix>"
 
         let gcs_uri: &'static str =
             "https://storage.googleapis.com/storage/v1/b/acrelab-production-us1c-transfer/o?prefix=bourdain/xray/parcel/one/cdl/json";
@@ -58,24 +69,44 @@ pub mod ops {
             .send()
             .await?;
 
-        //println!("Status: {}", res.status());
-        //println!("Headers:\n{:#?}", res.headers());
         let body = res.text().await?;
-        println!("Body:\n{}", body);
+        //println!("Body:\n{}", body);
 
         let resp: types::GCSListResponse = serde_json::from_str(&body)?;
 
         for res in resp.contents() {
-            println!("{:?}", res);
+            println!("{}", res.name);
         }
 
         Ok(())
     }
 
+    // Streaming Upload
+    //
+    // 1.) Neon's call of .upload():
+    // https://github.com/neondatabase/neon/blob/8c6d133d31ced1dc9bba9fc79a9ca2d50c636b66/pageserver/src/tenant/remote_timeline_client/upload.rs#L140C1-L148C81
+    //
+    // 2.) Neon's .upload impl:
+    // https://github.com/neondatabase/neon/blob/8c2f85b20922c9c32d255da6b0b362b7b323eb82/libs/remote_storage/src/s3_bucket.rs#L718C1-L727C21
+    //
+    // 3.) Which is AWS S3 SDK, takes a byte streams, calls .send():
+    // https://docs.rs/aws-sdk-s3/latest/src/aws_sdk_s3/operation/put_object/builders.rs.html#137-156
+    //
+    // 4.) Which calls .orchestrate():
+    // https://docs.rs/aws-sdk-s3/latest/src/aws_sdk_s3/operation/put_object.rs.html#11
+    //
+    //
+    //
+    //
+    //
+    // Great goby: https://imfeld.dev/writing/rust_s3_streaming_upload
+    // Algorithtim:
+    // -
     pub async fn upload(token_provider: Arc<dyn TokenProvider>, file: String) -> Result<()> {
-        // upload foo.txt for now
-        let gcs_uri: &'static str =
-            "https://storage.googleapis.com/upload/storage/v1/b/acrelab-production-us1c-transfer/o?uploadType=media&name=foo.txt";
+        let upload_uri_base: String =
+            "https://storage.googleapis.com/upload/storage/v1/b/acrelab-production-us1c-transfer/o?uploadType=media&name=".to_owned();
+
+        let gcs_uri: String = upload_uri_base + &file;
 
         // https://cloud.google.com/storage/docs/xml-api/reference-headers#chunked
         let mut headers = header::HeaderMap::new();
@@ -83,36 +114,41 @@ pub mod ops {
             header::TRANSFER_ENCODING,
             header::HeaderValue::from_static("chunked"),
         );
-        headers.insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
-        );
         // read from file system into Stream of bytes
         // ---
         // https://docs.rs/tokio-util/latest/tokio_util/codec/struct.BytesCodec.html
         // ---
         // "codec" = portmaneau of coder/decoder. handles a data stream.
-        let async_read = tokio::fs::File::open("./foo.txt").await?;
-        let stream = FramedRead::new(async_read, BytesCodec::new());
-
+        let async_read = tokio::fs::File::open(file.as_str()).await?;
+        let buf_reader = tokio::io::BufReader::with_capacity(1024 * 1024, async_read);
+        let stream = FramedRead::new(buf_reader, BytesCodec::new());
         // https://docs.rs/tokio-util/latest/tokio_util/codec/index.html
         // https://cloud.google.com/storage/docs/uploading-objects
         // https://docs.rs/reqwest/latest/reqwest/struct.Body.html#method.wrap_stream
         // https://gist.github.com/Ciantic/aa97c7a72f8356d7980756c819563566
         let res = Client::new()
             .post(gcs_uri)
+            // assert that this isn't being read into memory
             .body(reqwest::Body::wrap_stream(stream))
             .headers(headers)
             .bearer_auth(token_provider.token(SCOPES).await?.as_str())
             .send()
             .await?;
 
-        println!("---- streaming upload -----");
-        println!("Status: {}", res.status());
-        println!("Headers:\n{:#?}", res.headers());
+        // API should really be: "i wasnt able to do it, try again later", since a lot of things could go wrong.
+        // - file couldnt be read
+        // - socket closed connection
 
-        let body = res.text().await?;
-        println!("Body:\n{}", body);
+        // Try sending 8GiB file and see if it reads it all into memory.
+
+        // Read about Rust and GDB (cli debugger) to avoid VSCode.
+
+        //println!("---- streaming upload -----");
+        //println!("Status: {}", res.status());
+        //println!("Headers:\n{:#?}", res.headers());
+
+        //let body = res.text().await?;
+        //println!("Body:\n{}", body);
 
         Ok(())
     }
@@ -129,27 +165,27 @@ pub mod ops {
         #[derive(Serialize, Deserialize, Debug)]
         #[serde(rename_all = "snake_case")]
         pub struct GCSObject {
-            name: String,
-            bucket: String,
-            generation: String,
-            metageneration: String,
+            pub name: String,
+            pub bucket: String,
+            pub generation: String,
+            pub metageneration: String,
             #[serde(rename = "contentType")]
-            content_type: String,
+            pub content_type: String,
             #[serde(rename = "storageClass")]
-            storage_class: String,
-            size: String,
+            pub storage_class: String,
+            pub size: String,
             #[serde(rename = "md5Hash")]
-            md5_hash: String,
-            crc32c: String,
-            etag: String,
+            pub md5_hash: String,
+            pub crc32c: String,
+            pub etag: String,
             #[serde(rename = "timeCreated")]
-            time_created: String,
-            updated: String,
+            pub time_created: String,
+            pub updated: String,
             #[serde(rename = "timeStorageClassUpdated")]
-            time_storage_class_updated: String,
+            pub time_storage_class_updated: String,
             #[serde(rename = "timeFinalized")]
-            time_finalized: String,
-            metadata: Map<String, String>,
+            pub time_finalized: String,
+            pub metadata: Map<String, String>,
         }
 
         impl GCSListResponse {
@@ -193,10 +229,7 @@ async fn main() -> Result<()> {
     //list(Arc::clone(&provider)).await?;
 
     // -- Upload object --
-    upload(Arc::clone(&provider), "./foo.txt".to_owned()).await?;
-
-    // -- Resumably Upload objects --
-    //upload(Arc::clone(&provider), "./foo.txt".to_owned()).await?;
+    upload(Arc::clone(&provider), "./foo.jsonl".to_owned()).await?;
 
     Ok(())
 }

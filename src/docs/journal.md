@@ -25,6 +25,8 @@ etc, where that will compile down to just 'CustomServiceAccount'. Now, I'm not g
 run-time cost, and I'm getting to pass around ownership, and I'm getting to call my
 `.token()` method for refresh logic.
 
+This is all lies. All of that. Has to be dynamic dispatch. How would `provider()` know?
+
 
 `TokenProvider` is a trait.
 

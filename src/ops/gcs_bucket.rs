@@ -133,6 +133,7 @@ impl RemoteStorage for GCSBucket {
         max_keys: Option<NonZeroU32>,
     ) -> impl Stream<Item = Result<types::Listing, types::DownloadError>> {
         let mut max_keys = max_keys.map(|mk| mk.get() as i32);
+        println!("outside of stream");
 
         // Initial request URI
         let mut gcs_uri = self.bucket_name.clone() + "/o?prefix=" + &remote_prefix.unwrap();
@@ -152,7 +153,6 @@ impl RemoteStorage for GCSBucket {
                 let resp = self.list_objects(gcs_uri.clone()).await?;
                 for res in resp.contents() {
 
-                   println!("Item: {} -- {}", res.name, res.updated.clone().unwrap());
                    // Convert 'updated' to SystemTime
                    let last_modified = res.updated.clone().unwrap();
                    //let last_modified = match res.updated.map(SystemTime::try_from) {
@@ -179,18 +179,21 @@ impl RemoteStorage for GCSBucket {
                        assert!(mk > 0);
                        mk -= 1;
                        if mk == 0 {
+                          println!("limit reached set by max_keys");
                           yield Ok(result);
                           break 'outer;
                        }
                        max_keys = Some(mk);
+                       //println!("updated max_keys to: {:?}", &max_keys);
                    };
                 }
 
-                // Either yield
+                println!("yielding, not max_key limit reached.");
                 yield Ok(result);
 
                 continuation_token = match resp.next_page_token {
                     Some(token) => {
+                        println!("got a continuation_token!");
                         gcs_uri = gcs_uri + "?pageToken=" + &token;
                         Some(token)
                     },

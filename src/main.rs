@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
     //gcs.list_objects(remote_prefix).await?;
 
-    let max_keys: u32 = 20;
+    let max_keys: u32 = 100000;
     let mut stream = pin!(gcs.list_streaming(Some(remote_prefix), NonZero::new(max_keys)));
     // Return some iterator
     let mut combined = stream.next().await.expect("At least one item required")?;
@@ -56,6 +56,9 @@ async fn main() -> Result<()> {
         combined.keys.extend(list.keys.into_iter());
         combined.prefixes.extend_from_slice(&list.prefixes);
     }
+    //for key in combined.keys {
+    //    println!("Item: {} -- {}", key.key, key.last_modified);
+    //}
 
     Ok(())
 }

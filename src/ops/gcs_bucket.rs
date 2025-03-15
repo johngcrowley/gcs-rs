@@ -1,10 +1,15 @@
 #![allow(dead_code)]
 #![allow(unused)]
 
+// ---------------------------------------------------------------------------------
+// a cli utility that will try to use my GCS lib as if its trying to use their S3 one
+// ---------------------------------------------------------------------------------
+
 use crate::ops::types;
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use bytes::BytesMut;
+use chrono::NaiveDateTime;
 use futures::stream::Stream;
 use futures::stream::TryStreamExt;
 use futures_util::StreamExt;
@@ -12,16 +17,22 @@ use gcp_auth::{Token, TokenProvider};
 use http::Method;
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
+use std::pin::pin;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio_util::codec::{BytesCodec, FramedRead};
+use tokio_util::sync::CancellationToken;
+use types::{DownloadError, Listing, ListingObject};
 
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
 
-pub struct RemoteStorage {
+pub struct GCSBucket {
     pub token_provider: Arc<dyn TokenProvider>,
+    pub bucket_name: String,
 }
 
-impl RemoteStorage {
+impl GCSBucket {
     // Streaming Upload
     // 1.) Neon's call of .upload():
     // https://github.com/neondatabase/neon/blob/8c6d133d31ced1dc9bba9fc79a9ca2d50c636b66/pageserver/src/tenant/remote_timeline_client/upload.rs#L140C1-L148C81
@@ -70,9 +81,13 @@ impl RemoteStorage {
         Ok(())
     }
 
-    pub async fn list(&self) -> Result<()> {
-        // Client:
-        // ----------------------------------
+    // GCS List Objects
+    // - Vec holds Object, here Neon calls '.contents()' to loop throught the Vec of Objects
+    // https://github.com/neondatabase/neon/blob/2a5d7e5a78f7d699ee6590220609111bd93b07f6/libs/remote_storage/src/s3_bucket.rs#L568
+    pub async fn list_objects(&self, gcs_uri: String) -> Result<types::GCSListResponse> {
+        // -----------
+        // | Client: |
+        // -----------
         // AWS S3 SDK for Rust has a ListObjectsV2 call on the Client.
         // It returns a ListObjectsV2FluentBuilder, which has `.send()` impld on it.
         // That `.send()` returns a Result<ListObjectsV2Output, SDKError>
@@ -87,16 +102,6 @@ impl RemoteStorage {
         // ---
         // So my GCSListReponse should be the parent Vec, and each item in it the
         // ListResponseObject, which should impl an interface similar to that.
-        //
-        // Neon:
-        // ----------------------------------
-        // https://github.com/neondatabase/neon/blob/8c2f85b20922c9c32d255da6b0b362b7b323eb82/libs/remote_storage/src/s3_bucket.rs#L494C4-L499C36
-        // We care about 'key', 'last_modified', and 'size'
-        // ---
-        // We take in a "mode", "max_keys", "cancel (token)", and "Option<prefix>"
-
-        let gcs_uri: &'static str =
-            "https://storage.googleapis.com/storage/v1/b/acrelab-production-us1c-transfer/o?prefix=bourdain/xray/parcel/one/cdl/json";
 
         let res = Client::new()
             .get(gcs_uri)
@@ -105,14 +110,125 @@ impl RemoteStorage {
             .await?;
 
         let body = res.text().await?;
-        //println!("Body:\n{}", body);
-
         let resp: types::GCSListResponse = serde_json::from_str(&body)?;
-
-        for res in resp.contents() {
-            println!("{}", res.name);
-        }
-
-        Ok(())
+        Ok(resp)
     }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait RemoteStorage: Send + Sync + 'static {
+    fn list_streaming(
+        &self,
+        prefix: Option<String>,
+        max_keys: Option<NonZeroU32>,
+    ) -> impl Stream<Item = Result<Listing, DownloadError>> + Send;
+}
+
+impl RemoteStorage for GCSBucket {
+    // List Streaming -- interface attaches here:
+    // https://github.com/neondatabase/neon/blob/main/libs/remote_storage/src/lib.rs#L293
+    fn list_streaming(
+        &self,
+        remote_prefix: Option<String>,
+        max_keys: Option<NonZeroU32>,
+    ) -> impl Stream<Item = Result<types::Listing, types::DownloadError>> {
+        let mut max_keys = max_keys.map(|mk| mk.get() as i32);
+
+        // Initial request URI
+        let mut gcs_uri = self.bucket_name.clone() + "/o?prefix=" + &remote_prefix.unwrap();
+
+        async_stream::stream! {
+
+            println!("restarting loop");
+            let mut continuation_token = None;
+
+            // a loop -- this is how the 'continuation token' button keeps getting hit
+            'outer: loop {
+
+                let mut result = types::Listing::default();
+                println!(" --- new batch ---");
+
+                // First layer: Get a GCS Response of GCS Objects
+                let resp = self.list_objects(gcs_uri.clone()).await?;
+                for res in resp.contents() {
+
+                   println!("Item: {} -- {}", res.name, res.updated.clone().unwrap());
+                   // Convert 'updated' to SystemTime
+                   let last_modified = res.updated.clone().unwrap();
+                   //let last_modified = match res.updated.map(SystemTime::try_from) {
+                   //    Some(Ok(t)) => t,
+                   //    _ => SystemTime::now()
+                   //};
+
+                   // Convert 'size' to u64
+                   let size = res.size.clone().unwrap_or("0".to_string()).parse::<u64>().unwrap();
+
+                   let key = res.name.clone();
+
+                   // Second layer: for each GCS Object in GCSReponse, pluck out the ingredients to make a
+                   // ListingObject and fill up a Listing.
+                   result.keys.push(
+                        types::ListingObject{
+                            key,
+                            last_modified,
+                            size,
+                        }
+                   );
+
+                   if let Some(mut mk) = max_keys {
+                       assert!(mk > 0);
+                       mk -= 1;
+                       if mk == 0 {
+                          yield Ok(result);
+                          break 'outer;
+                       }
+                       max_keys = Some(mk);
+                   };
+                }
+
+                // Either yield
+                yield Ok(result);
+
+                continuation_token = match resp.next_page_token {
+                    Some(token) => {
+                        gcs_uri = gcs_uri + "?pageToken=" + &token;
+                        Some(token)
+                    },
+                    None => break
+                }
+            }
+        }
+    }
+
+    // ---------
+    // | Neon: |
+    // ---------
+    // They insist they call 'list' but implement 'list_streaming' when that's called:
+    // https://github.com/neondatabase/neon/commit/2c0d311a54927dabea9ae4f97559a0d878f36d9c
+    // ---
+    // Yes, here they confess that the interface is `GenericRemoteStorage`:
+    // https://github.com/neondatabase/neon/blob/main/libs/remote_storage/src/lib.rs#L1C1-L7C79
+    // ---
+    // And here is the `list()` wrapper around `list_streaming()`:
+    // https://github.com/neondatabase/neon/blob/main/libs/remote_storage/src/lib.rs#L286C2-L301C6
+    // ---
+    // it's `while let Some()-ing` til it gets back a None and tacks on results to the
+    // `.keys` attribute of the Type returned by `list_streaming`:  impl Stream<Item = Result<Listing, DownloadError>>
+    // ---
+    // That type is the Stream<Result<-wrapped "`Listing`" struct defined here:
+    // https://github.com/neondatabase/neon/blob/2a5d7e5a78f7d699ee6590220609111bd93b07f6/libs/remote_storage/src/lib.rs#L178C1-L182C2
+    // ---
+    // All those structs are implemented for me in `lib.rs`  as the Generic interfaces. I just
+    // need to make provider-specific calls to be wrapped and try to use those same generic
+    // Types.
+    // ---
+    // https://github.com/neondatabase/neon/blob/8c2f85b20922c9c32d255da6b0b362b7b323eb82/libs/remote_storage/src/s3_bucket.rs#L494C4-L499C36
+    // We care about 'key', 'last_modified', and 'size' to load up into our `ListingObject` of
+    // Type `Listing` (vec of `ListingObjects`)
+    // ---
+    // We take in a "mode", "max_keys", "cancel (token)", and "Option<prefix>"
+
+    // source + sink. `cat` is a source.
+    //
+    // Queue load management in 2 ways: backpressure or consumer drops stuff.
 }

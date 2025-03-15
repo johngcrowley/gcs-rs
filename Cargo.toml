@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
+async-stream = "0.3.6"
 bytes = "1.10.0"
+chrono = "0.4.40"
 clap = "4.5.26"
 futures = "0.3.31"
 futures-util = "0.3.31"

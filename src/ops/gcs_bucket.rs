@@ -174,7 +174,13 @@ impl RemoteStorage for GCSBucket {
                             size,
                         }
                    );
-
+                   // TODO: when fork, write unit test to expose this bug.
+                   // this never gets hit, because `max_keys`  is always `None`
+                   // we take min of:
+                   // https://github.com/neondatabase/neon/blob/main/libs/remote_storage/src/lib.rs#L71
+                   // or
+                   // https://github.com/search?q=repo%3Aneondatabase%2Fneon%20%22.list_streaming%22&type=code
+                   // point being: every call to `.list_streaming()` sets `max_keys` to `None`.
                    if let Some(mut mk) = max_keys {
                        assert!(mk > 0);
                        mk -= 1;

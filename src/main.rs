@@ -29,6 +29,9 @@ async fn main() -> Result<()> {
             .to_string(),
     };
 
+    const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
+    println!("{:?}", gcs.token_provider.token(SCOPES).await?.as_str());
+
     // Upload:
 
     //let source_file = tokio::fs::File::open("./tests/nullbytes").await?;
@@ -43,19 +46,20 @@ async fn main() -> Result<()> {
 
     //gcs.list_objects(remote_prefix).await?;
 
-    let max_keys: u32 = 100000;
-    let mut stream = pin!(gcs.list_streaming(Some(remote_prefix), NonZero::new(max_keys)));
-    // Return some iterator
-    let mut combined = stream.next().await.expect("At least one item required")?;
-    // Loop over it til its None
-    while let Some(list) = stream.next().await {
-        // The ListingObject vector we return from 'list_streaming()'
-        let list = list?;
-        // Use original ListingObject's .keys as the parent vector to add stuff to from
-        // subsequent
-        combined.keys.extend(list.keys.into_iter());
-        combined.prefixes.extend_from_slice(&list.prefixes);
-    }
+    //let max_keys: u32 = 100000;
+    //let mut stream = pin!(gcs.list_streaming(Some(remote_prefix), NonZero::new(max_keys)));
+    //// Return some iterator
+    //let mut combined = stream.next().await.expect("At least one item required")?;
+    //// Loop over it til its None
+    //while let Some(list) = stream.next().await {
+    //    // The ListingObject vector we return from 'list_streaming()'
+    //    let list = list?;
+    //    // Use original ListingObject's .keys as the parent vector to add stuff to from
+    //    // subsequent
+    //    combined.keys.extend(list.keys.into_iter());
+    //    combined.prefixes.extend_from_slice(&list.prefixes);
+    //}
+
     //for key in combined.keys {
     //    println!("Item: {} -- {}", key.key, key.last_modified);
     //}

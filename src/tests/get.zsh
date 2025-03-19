@@ -13,11 +13,17 @@ bearer="ya29.c.c0ASRK0GYz2uYs5isMUOgNAz7PiDVFY7qwpz5gHEJpwdG2E5slDKiXvk9gudzCmAF
 
 # ---- Get ----
 
-typeset obj="foo.txt"
+#typeset obj="foo.txt"
+#curl -v -X GET \
+#  -H "Authorization: Bearer $bearer" \
+#  -o "./foo.txt" \
+#  "https://storage.googleapis.com/storage/v1/b/acrelab-production-us1c-transfer/o/$obj?alt=media"
+#
+obj="cdl%2Fyankee%2Fboundary.jsonl"
+bucket=acrelab-production-us1c-transfer
 curl -v -X GET \
-  -H "Authorization: Bearer $bearer" \
-  -o "./foo.txt" \
-  "https://storage.googleapis.com/storage/v1/b/acrelab-production-us1c-transfer/o/$obj?alt=media"
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  "https://storage.googleapis.com/storage/v1/b/$bucket/o/$obj?alt=json" 
 
 
 ## ---- Resumable Upload Session URI ----

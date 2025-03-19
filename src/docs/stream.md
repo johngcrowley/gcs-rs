@@ -1,3 +1,14 @@
+Passing the Body (where the bytes stream / data is) through the function, pinning it in memory, and returning that
+to be iterated on as a `Stream` in Rust, which is an async iterator, whose `.next()` method, from the `futures_util::StreamExt` trait,
+converts each item into a `Future` to be awaited.
+
+I needed to "parse" the headers (metadata, etag, etc) but didnt want to have to collect all the water out of the pipe into a serialized struct
+just to tell the water's temperature. So i do a first request with the `alt=json` URI modifier, parse the `.text()` of the whole response into that struct.
+
+Then I can call the URI with `alt=media` (download the byte stream) and pass _that_ to a pinned field in my return object, `Download` type.
+
+---
+
 Stream is an abstraction. Consistent across languages.
 
 Linux Kernel only has `read()` `close()` and `open()` etc SysCalls.

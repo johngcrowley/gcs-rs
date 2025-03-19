@@ -1,12 +1,9 @@
 #![allow(dead_code)]
 #![allow(unused)]
 
-// ---------------------------------------------------------------------------------
-// a cli utility that will try to use my GCS lib as if its trying to use their S3 one
-// ---------------------------------------------------------------------------------
-
 use crate::ops::types;
 use anyhow::{Error, Result};
+use azure_core::Etag;
 use bytes::Bytes;
 use bytes::BytesMut;
 use chrono::NaiveDateTime;
@@ -15,12 +12,16 @@ use futures::stream::TryStreamExt;
 use futures_util::StreamExt;
 use gcp_auth::{Token, TokenProvider};
 use http::Method;
+use http::StatusCode;
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt::Debug;
 use std::num::NonZeroU32;
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::sync::Arc;
-use std::time::SystemTime;
+use url::Url;
+//use std::time::SystemTime;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::sync::CancellationToken;
 use types::{DownloadError, Listing, ListingObject};
@@ -33,16 +34,6 @@ pub struct GCSBucket {
 }
 
 impl GCSBucket {
-    // Streaming Upload
-    // 1.) Neon's call of .upload():
-    // https://github.com/neondatabase/neon/blob/8c6d133d31ced1dc9bba9fc79a9ca2d50c636b66/pageserver/src/tenant/remote_timeline_client/upload.rs#L140C1-L148C81
-    // 2.) Neon's .upload impl:
-    // https://github.com/neondatabase/neon/blob/8c2f85b20922c9c32d255da6b0b362b7b323eb82/libs/remote_storage/src/s3_bucket.rs#L718C1-L727C21
-    // 3.) Which is AWS S3 SDK, takes a byte streams, calls .send():
-    // https://docs.rs/aws-sdk-s3/latest/src/aws_sdk_s3/operation/put_object/builders.rs.html#137-156
-    // 4.) Which calls .orchestrate():
-    // https://docs.rs/aws-sdk-s3/latest/src/aws_sdk_s3/operation/put_object.rs.html#11
-
     pub async fn upload(
         &self,
         byte_stream: impl Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
@@ -65,44 +56,12 @@ impl GCSBucket {
             .send()
             .await?;
 
-        // API should really be: "i wasnt able to do it, try again later", since a lot of things could go wrong.
-        // - file couldnt be read
-        // - socket closed connection
-
-        // Read about Rust and GDB (cli debugger) to avoid VSCode.
-
-        //println!("---- streaming upload -----");
-        //println!("Status: {}", res.status());
-        //println!("Headers:\n{:#?}", res.headers());
-
-        //let body = res.text().await?;
-        //println!("Body:\n{}", body);
+        println!("Status: {}", res.status());
 
         Ok(())
     }
 
-    // GCS List Objects
-    // - Vec holds Object, here Neon calls '.contents()' to loop throught the Vec of Objects
-    // https://github.com/neondatabase/neon/blob/2a5d7e5a78f7d699ee6590220609111bd93b07f6/libs/remote_storage/src/s3_bucket.rs#L568
     pub async fn list_objects(&self, gcs_uri: String) -> Result<types::GCSListResponse> {
-        // -----------
-        // | Client: |
-        // -----------
-        // AWS S3 SDK for Rust has a ListObjectsV2 call on the Client.
-        // It returns a ListObjectsV2FluentBuilder, which has `.send()` impld on it.
-        // That `.send()` returns a Result<ListObjectsV2Output, SDKError>
-        // the ListObjectsV2Output is a struct like my `GCSListResponse` that parses the fields of
-        // the response.
-        // https://github.com/awslabs/aws-sdk-rust/blob/main/sdk/s3/src/operation/list_objects_v2/_list_objects_v2_output.rs#L5
-        // ---
-        // Here is how the `client.list_objects_v2().send()` gets used (records are fetched):
-        // https://github.com/awslabs/aws-sdk-rust/blob/main/examples/examples/s3/src/bin/list-objects.rs#L27
-        // ---
-        // `res.contents()` is an iterator (Vec) of Option<Object> and Object has a `.key()`.
-        // ---
-        // So my GCSListReponse should be the parent Vec, and each item in it the
-        // ListResponseObject, which should impl an interface similar to that.
-
         let res = Client::new()
             .get(gcs_uri)
             .bearer_auth(self.token_provider.token(SCOPES).await?.as_str())
@@ -112,6 +71,160 @@ impl GCSBucket {
         let body = res.text().await?;
         let resp: types::GCSListResponse = serde_json::from_str(&body)?;
         Ok(resp)
+    }
+
+    // need a 'bucket', a 'key', and a bytes 'range'.
+    pub async fn download_object(&self, key: String) -> Result<Download, DownloadError> {
+        // Metadata from body
+        let metadata_uri_mod = "alt=json";
+        let uri = format!(
+            "{}/o/{}?{}",
+            self.bucket_name,
+            key.replace("/", "%2F"),
+            metadata_uri_mod
+        );
+        let url_encoded = Url::parse(&uri).unwrap();
+        println!("{}", url_encoded.as_str());
+
+        let res = Client::new()
+            .get(uri)
+            .bearer_auth(
+                self.token_provider
+                    .token(SCOPES)
+                    .await
+                    .map_err(|e: gcp_auth::Error| DownloadError::Other(e.into()))?
+                    .as_str(),
+            )
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| DownloadError::Other(e.into()))?;
+
+        let body = res
+            .text()
+            .await
+            .map_err(|e: reqwest::Error| DownloadError::Other(e.into()))?;
+
+        let resp: types::GCSObject = serde_json::from_str(&body)
+            .map_err(|e: serde_json::Error| DownloadError::Other(e.into()))?;
+
+        println!("{:?}", resp);
+
+        //let mut metadata = HashMap::new();
+
+        let stream_uri_mod = "alt=media";
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RANGE, header::HeaderValue::from_static("bytes=0-"));
+
+        let uri = format!("{}/o/{}?{}", self.bucket_name, key, stream_uri_mod);
+        let url_encoded: String = url::form_urlencoded::byte_serialize(uri.as_bytes()).collect();
+        println!("{url_encoded}");
+
+        let mut res = Client::new()
+            .get(uri)
+            .headers(headers)
+            .bearer_auth(
+                self.token_provider
+                    .token(SCOPES)
+                    .await
+                    .map_err(|e: gcp_auth::Error| DownloadError::Other(e.into()))?
+                    .as_str(),
+            )
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| DownloadError::Other(e.into()))?;
+
+        // Eureka:
+        // 1. Reqwest is .await-ing on the socket to open. that's it.
+        // 2. We check the header status_code to continue or not. we can check the color of water
+        //    without having to collect all of it!
+        // 3. We then call 'bytes_stream' to get a `Stream`. This is an aynchronous iterator.
+        // 4. Each call to it looks like `.next().await` which is what creates the `Future`
+        // 5. But! We don't do that here. We do it in the outer functions of Neon that call this
+        //    function.
+        //    https://github.com/neondatabase/neon/blob/55cb07f680603ff768a3cbe1ff8367a4fe8566e2/libs/remote_storage/src/local_fs.rs#L1194C1-L1203C16
+        // 6. We have to apply a mask over our stream with Serde
+        // 7. And to return a Stream from a function we need to Pin it in memory.
+        // --- Those two requirements are what I need to do-.
+        // Notes:
+        // - the `tokio::select!` thing in the S3 download function is just a race. It's checking
+        //   if the timeout Future finishes first before the request.
+
+        // We serialize headers
+        if !res.status().is_success() {
+            match res.status() {
+                StatusCode::NOT_FOUND => return Err(DownloadError::NotFound),
+                _ => {
+                    return Err(DownloadError::Other(anyhow::anyhow!(
+                        "GCS GET resposne contained no response body"
+                    )))
+                }
+            }
+        };
+
+        //let resp: types::GCSObject = serde_json::from_str(fresh_headers)
+        //    .map_err(|e: serde_json::Error| DownloadError::Other(e.into()))?;
+
+        //println!("{:?}", resp);
+
+        // But let data stream pass through
+        Ok(Download {
+            download_stream: Box::pin(res.bytes_stream().map(|item| {
+                item.map_err(|e: reqwest::Error| std::io::Error::new(std::io::ErrorKind::Other, e))
+            })),
+            etag: resp.etag.into(),
+            last_modified: resp.updated.unwrap(),
+            metadata: Some(StorageMetadata(resp.metadata.unwrap())),
+        })
+    }
+}
+
+struct GetObjectRequest {
+    bucket: String,
+    key: String,
+    etag: Option<String>,
+    range: Option<String>,
+}
+
+/// Data part of an ongoing [`Download`].
+///
+/// `DownloadStream` is sensitive to the timeout and cancellation used with the original
+/// [`RemoteStorage::download`] request. The type yields `std::io::Result<Bytes>` to be compatible
+/// with `tokio::io::copy_buf`.
+// This has 'static because safekeepers do not use cancellation tokens (yet)
+pub type DownloadStream =
+    Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static>>;
+
+pub struct Download {
+    pub download_stream: DownloadStream,
+    /// The last time the file was modified (`last-modified` HTTP header)
+    pub last_modified: String,
+    /// A way to identify this specific version of the resource (`etag` HTTP header)
+    pub etag: Etag,
+    /// Extra key-value data, associated with the current remote file.
+    pub metadata: Option<StorageMetadata>,
+}
+
+impl Debug for Download {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Download")
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+/// Extra set of key-value pairs that contain arbitrary metadata about the storage entry.
+/// Immutable, cannot be changed once the file is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMetadata(HashMap<String, String>);
+
+impl<const N: usize> From<[(&str, &str); N]> for StorageMetadata {
+    fn from(arr: [(&str, &str); N]) -> Self {
+        let map: HashMap<String, String> = arr
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self(map)
     }
 }
 
@@ -125,48 +238,26 @@ pub trait RemoteStorage: Send + Sync + 'static {
 }
 
 impl RemoteStorage for GCSBucket {
-    // List Streaming -- interface attaches here:
-    // https://github.com/neondatabase/neon/blob/main/libs/remote_storage/src/lib.rs#L293
     fn list_streaming(
         &self,
         remote_prefix: Option<String>,
         max_keys: Option<NonZeroU32>,
     ) -> impl Stream<Item = Result<types::Listing, types::DownloadError>> {
         let mut max_keys = max_keys.map(|mk| mk.get() as i32);
-        println!("outside of stream");
-
-        // Initial request URI
         let mut gcs_uri = self.bucket_name.clone() + "/o?prefix=" + &remote_prefix.unwrap();
 
         async_stream::stream! {
-
-            println!("restarting loop");
             let mut continuation_token = None;
 
-            // a loop -- this is how the 'continuation token' button keeps getting hit
             'outer: loop {
 
                 let mut result = types::Listing::default();
-                println!(" --- new batch ---");
-
-                // First layer: Get a GCS Response of GCS Objects
                 let resp = self.list_objects(gcs_uri.clone()).await?;
                 for res in resp.contents() {
 
-                   // Convert 'updated' to SystemTime
                    let last_modified = res.updated.clone().unwrap();
-                   //let last_modified = match res.updated.map(SystemTime::try_from) {
-                   //    Some(Ok(t)) => t,
-                   //    _ => SystemTime::now()
-                   //};
-
-                   // Convert 'size' to u64
                    let size = res.size.clone().unwrap_or("0".to_string()).parse::<u64>().unwrap();
-
                    let key = res.name.clone();
-
-                   // Second layer: for each GCS Object in GCSReponse, pluck out the ingredients to make a
-                   // ListingObject and fill up a Listing.
                    result.keys.push(
                         types::ListingObject{
                             key,
@@ -190,16 +281,13 @@ impl RemoteStorage for GCSBucket {
                           break 'outer;
                        }
                        max_keys = Some(mk);
-                       //println!("updated max_keys to: {:?}", &max_keys);
                    };
                 }
 
-                println!("yielding, not max_key limit reached.");
                 yield Ok(result);
 
                 continuation_token = match resp.next_page_token {
                     Some(token) => {
-                        println!("got a continuation_token!");
                         gcs_uri = gcs_uri + "?pageToken=" + &token;
                         Some(token)
                     },
@@ -208,36 +296,4 @@ impl RemoteStorage for GCSBucket {
             }
         }
     }
-
-    // ---------
-    // | Neon: |
-    // ---------
-    // They insist they call 'list' but implement 'list_streaming' when that's called:
-    // https://github.com/neondatabase/neon/commit/2c0d311a54927dabea9ae4f97559a0d878f36d9c
-    // ---
-    // Yes, here they confess that the interface is `GenericRemoteStorage`:
-    // https://github.com/neondatabase/neon/blob/main/libs/remote_storage/src/lib.rs#L1C1-L7C79
-    // ---
-    // And here is the `list()` wrapper around `list_streaming()`:
-    // https://github.com/neondatabase/neon/blob/main/libs/remote_storage/src/lib.rs#L286C2-L301C6
-    // ---
-    // it's `while let Some()-ing` til it gets back a None and tacks on results to the
-    // `.keys` attribute of the Type returned by `list_streaming`:  impl Stream<Item = Result<Listing, DownloadError>>
-    // ---
-    // That type is the Stream<Result<-wrapped "`Listing`" struct defined here:
-    // https://github.com/neondatabase/neon/blob/2a5d7e5a78f7d699ee6590220609111bd93b07f6/libs/remote_storage/src/lib.rs#L178C1-L182C2
-    // ---
-    // All those structs are implemented for me in `lib.rs`  as the Generic interfaces. I just
-    // need to make provider-specific calls to be wrapped and try to use those same generic
-    // Types.
-    // ---
-    // https://github.com/neondatabase/neon/blob/8c2f85b20922c9c32d255da6b0b362b7b323eb82/libs/remote_storage/src/s3_bucket.rs#L494C4-L499C36
-    // We care about 'key', 'last_modified', and 'size' to load up into our `ListingObject` of
-    // Type `Listing` (vec of `ListingObjects`)
-    // ---
-    // We take in a "mode", "max_keys", "cancel (token)", and "Option<prefix>"
-
-    // source + sink. `cat` is a source.
-    //
-    // Queue load management in 2 ways: backpressure or consumer drops stuff.
 }

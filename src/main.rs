@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     };
 
     const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
-    println!("{:?}", gcs.token_provider.token(SCOPES).await?.as_str());
+    //println!("{:?}", gcs.token_provider.token(SCOPES).await?.as_str());
 
     // Upload:
 
@@ -42,9 +42,9 @@ async fn main() -> Result<()> {
 
     // List:
     let remote_prefix = "box/tiff/2023/TN".to_string();
-    let remote_prefix = "parcel-centroids/mri-parcel-centroids/13".to_string();
+    let remote_prefix = "cdl/yankee/boundary.jsonl".to_string();
 
-    //gcs.list_objects(remote_prefix).await?;
+    gcs.download_object(remote_prefix).await?;
 
     //let max_keys: u32 = 100000;
     //let mut stream = pin!(gcs.list_streaming(Some(remote_prefix), NonZero::new(max_keys)));

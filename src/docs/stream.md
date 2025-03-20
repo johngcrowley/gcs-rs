@@ -9,6 +9,24 @@ Then I can call the URI with `alt=media` (download the byte stream) and pass _th
 
 ---
 
+ Eureka:
+ 1. Reqwest is .await-ing on the socket to open. that's it.
+ 2. We check the header status_code to continue or not. we can check the color of water
+    without having to collect all of it!
+ 3. We then call 'bytes_stream' to get a `Stream`. This is an aynchronous iterator.
+ 4. Each call to it looks like `.next().await` which is what creates the `Future`
+ 5. But! We don't do that here. We do it in the outer functions of Neon that call this
+    function.
+    https://github.com/neondatabase/neon/blob/55cb07f680603ff768a3cbe1ff8367a4fe8566e2/libs/remote_storage/src/local_fs.rs#L1194C1-L1203C16
+ 6. We have to apply a mask over our stream with Serde
+ 7. And to return a Stream from a function we need to Pin it in memory.
+ --- Those two requirements are what I need to do-.
+ Notes:
+ - the `tokio::select!` thing in the S3 download function is just a race. It's checking
+   if the timeout Future finishes first before the request.
+
+---
+
 Stream is an abstraction. Consistent across languages.
 
 Linux Kernel only has `read()` `close()` and `open()` etc SysCalls.

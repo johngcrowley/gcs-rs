@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap as Map;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -46,7 +45,7 @@ impl GCSListResponse {
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct ListingObject {
     pub key: String,
-    pub last_modified: String,
+    pub last_modified: SystemTime,
     pub size: u64,
 }
 

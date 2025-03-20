@@ -6,6 +6,7 @@ use anyhow::{Error, Result};
 use azure_core::Etag;
 use bytes::Bytes;
 use bytes::BytesMut;
+use chrono::DateTime;
 use chrono::NaiveDateTime;
 use futures::stream::Stream;
 use futures::stream::TryStreamExt;
@@ -20,17 +21,20 @@ use std::fmt::Debug;
 use std::num::NonZeroU32;
 use std::pin::{pin, Pin};
 use std::sync::Arc;
-use url::Url;
-//use std::time::SystemTime;
+use std::time::SystemTime;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::sync::CancellationToken;
 use types::{DownloadError, Listing, ListingObject};
+use url::Url;
 
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
 
 pub struct GCSBucket {
     pub token_provider: Arc<dyn TokenProvider>,
     pub bucket_name: String,
+    pub prefix_in_bucket: Option<String>,
+    //max_keys_per_list_response: Option<i32>,
+    //pub timeout: std::time::Duration,
 }
 
 impl GCSBucket {
@@ -49,14 +53,47 @@ impl GCSBucket {
 
         let res = Client::new()
             .post(gcs_uri)
-            // assert that this isn't being read into memory
             .body(reqwest::Body::wrap_stream(byte_stream))
             .headers(headers)
             .bearer_auth(self.token_provider.token(SCOPES).await?.as_str())
             .send()
             .await?;
 
-        println!("Status: {}", res.status());
+        Ok(())
+    }
+
+    pub async fn copy(&self, from: String, to: String, cancel: &CancellationToken) -> Result<()> {
+        let bucket: &str = "acrelab-production-us1c-transfer";
+        let copy_uri = self.bucket_name.clone()
+            + "/"
+            + bucket
+            + "/o/"
+            + &from
+            + "/copyTo/b/"
+            + bucket
+            + "/o/"
+            + &to;
+        let res = Client::new().post(copy_uri);
+
+        Ok(())
+    }
+
+    pub async fn delete_objects(&self, paths: &[&str], cancel: &CancellationToken) -> Result<()> {
+        let mut delete_objects = Vec::with_capacity(paths.len());
+
+        let mut cancel = std::pin::pin!(cancel.cancelled());
+
+        for path in paths {
+            delete_objects.push(match &self.prefix_in_bucket {
+                Some(prefix) => self.bucket_name.clone() + &prefix.clone() + "/" + path,
+                None => self.bucket_name.clone() + "/" + path,
+            });
+        }
+
+        // Main request: "Content-Type: multipart/mixed"
+        // Nested requests: "Content-Type: application/http"
+
+        let res = Client::new();
 
         Ok(())
     }
@@ -74,8 +111,12 @@ impl GCSBucket {
     }
 
     // need a 'bucket', a 'key', and a bytes 'range'.
-    pub async fn download_object(&self, key: String) -> Result<Download, DownloadError> {
-        // Metadata from body
+    pub async fn download_object(
+        &self,
+        key: String,
+        cancel: &CancellationToken,
+    ) -> Result<Download, DownloadError> {
+        // Serialize Metadata in initial request
         let metadata_uri_mod = "alt=json";
         let uri = format!(
             "{}/o/{}?{}",
@@ -83,8 +124,7 @@ impl GCSBucket {
             key.replace("/", "%2F"),
             metadata_uri_mod
         );
-        let url_encoded = Url::parse(&uri).unwrap();
-        println!("{}", url_encoded.as_str());
+        let url_encoded: String = url::form_urlencoded::byte_serialize(uri.as_bytes()).collect();
 
         let res = Client::new()
             .get(uri)
@@ -99,6 +139,17 @@ impl GCSBucket {
             .await
             .map_err(|e: reqwest::Error| DownloadError::Other(e.into()))?;
 
+        if !res.status().is_success() {
+            match res.status() {
+                StatusCode::NOT_FOUND => return Err(DownloadError::NotFound),
+                _ => {
+                    return Err(DownloadError::Other(anyhow::anyhow!(
+                        "GCS GET resposne contained no response body"
+                    )))
+                }
+            }
+        };
+
         let body = res
             .text()
             .await
@@ -107,18 +158,12 @@ impl GCSBucket {
         let resp: types::GCSObject = serde_json::from_str(&body)
             .map_err(|e: serde_json::Error| DownloadError::Other(e.into()))?;
 
-        println!("{:?}", resp);
-
-        //let mut metadata = HashMap::new();
-
+        // Byte Stream request
         let stream_uri_mod = "alt=media";
-
         let mut headers = header::HeaderMap::new();
         headers.insert(header::RANGE, header::HeaderValue::from_static("bytes=0-"));
-
         let uri = format!("{}/o/{}?{}", self.bucket_name, key, stream_uri_mod);
         let url_encoded: String = url::form_urlencoded::byte_serialize(uri.as_bytes()).collect();
-        println!("{url_encoded}");
 
         let mut res = Client::new()
             .get(uri)
@@ -134,23 +179,6 @@ impl GCSBucket {
             .await
             .map_err(|e: reqwest::Error| DownloadError::Other(e.into()))?;
 
-        // Eureka:
-        // 1. Reqwest is .await-ing on the socket to open. that's it.
-        // 2. We check the header status_code to continue or not. we can check the color of water
-        //    without having to collect all of it!
-        // 3. We then call 'bytes_stream' to get a `Stream`. This is an aynchronous iterator.
-        // 4. Each call to it looks like `.next().await` which is what creates the `Future`
-        // 5. But! We don't do that here. We do it in the outer functions of Neon that call this
-        //    function.
-        //    https://github.com/neondatabase/neon/blob/55cb07f680603ff768a3cbe1ff8367a4fe8566e2/libs/remote_storage/src/local_fs.rs#L1194C1-L1203C16
-        // 6. We have to apply a mask over our stream with Serde
-        // 7. And to return a Stream from a function we need to Pin it in memory.
-        // --- Those two requirements are what I need to do-.
-        // Notes:
-        // - the `tokio::select!` thing in the S3 download function is just a race. It's checking
-        //   if the timeout Future finishes first before the request.
-
-        // We serialize headers
         if !res.status().is_success() {
             match res.status() {
                 StatusCode::NOT_FOUND => return Err(DownloadError::NotFound),
@@ -162,10 +190,20 @@ impl GCSBucket {
             }
         };
 
-        //let resp: types::GCSObject = serde_json::from_str(fresh_headers)
-        //    .map_err(|e: serde_json::Error| DownloadError::Other(e.into()))?;
+        //let object_output = tokio::select! {
+        //    res = get_object => res,
+        //    //_ = tokio::time::sleep(self.timeout) => return Err(DownloadError::Timeout),
+        //    _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
+        //};
 
-        //println!("{:?}", resp);
+        let metadata = resp.metadata.map(StorageMetadata);
+
+        // How does "into()" really work?
+        let last_modified: SystemTime = resp
+            .updated
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|s| s.into())
+            .unwrap_or(SystemTime::now());
 
         // But let data stream pass through
         Ok(Download {
@@ -173,8 +211,8 @@ impl GCSBucket {
                 item.map_err(|e: reqwest::Error| std::io::Error::new(std::io::ErrorKind::Other, e))
             })),
             etag: resp.etag.into(),
-            last_modified: resp.updated.unwrap(),
-            metadata: Some(StorageMetadata(resp.metadata.unwrap())),
+            last_modified,
+            metadata,
         })
     }
 }
@@ -198,7 +236,7 @@ pub type DownloadStream =
 pub struct Download {
     pub download_stream: DownloadStream,
     /// The last time the file was modified (`last-modified` HTTP header)
-    pub last_modified: String,
+    pub last_modified: SystemTime,
     /// A way to identify this specific version of the resource (`etag` HTTP header)
     pub etag: Etag,
     /// Extra key-value data, associated with the current remote file.
@@ -255,7 +293,11 @@ impl RemoteStorage for GCSBucket {
                 let resp = self.list_objects(gcs_uri.clone()).await?;
                 for res in resp.contents() {
 
-                   let last_modified = res.updated.clone().unwrap();
+                   let last_modified: SystemTime = res.updated.clone()
+                       .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                       .map(|s| s.into())
+                       .unwrap_or(SystemTime::now());
+
                    let size = res.size.clone().unwrap_or("0".to_string()).parse::<u64>().unwrap();
                    let key = res.name.clone();
                    result.keys.push(
@@ -295,5 +337,56 @@ impl RemoteStorage for GCSBucket {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use gcp_auth;
+    use std::num::NonZero;
+    use std::pin::pin;
+    use std::sync::Arc;
+
+    const BUFFER_SIZE: usize = 32 * 1024;
+    const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
+    const BUCKET: &str =
+        "https://storage.googleapis.com/storage/v1/b/acrelab-production-us1c-transfer";
+
+    // ---
+
+    #[tokio::test]
+    async fn list_returns_keys_from_bucket() {
+        let provider = gcp_auth::provider().await.unwrap();
+        let gcs = GCSBucket {
+            token_provider: Arc::clone(&provider),
+            bucket_name: BUCKET.to_string(),
+            prefix_in_bucket: None,
+        };
+
+        // --- List: ---
+        let cancel = CancellationToken::new();
+        let remote_prefix = "box/tiff/2023/TN".to_string();
+        let max_keys: u32 = 100;
+        let mut stream = pin!(gcs.list_streaming(Some(remote_prefix), NonZero::new(max_keys)));
+        // Return some iterator
+        let mut combined = stream
+            .next()
+            .await
+            .expect("At least one item required")
+            .unwrap();
+        while let Some(list) = stream.next().await {
+            // The ListingObject vector we return from 'list_streaming()'
+            let list = list.unwrap();
+            combined.keys.extend(list.keys.into_iter());
+            combined.prefixes.extend_from_slice(&list.prefixes);
+        }
+
+        for key in combined.keys.iter() {
+            println!("Item: {} -- {:?}", key.key, key.last_modified);
+        }
+
+        assert_ne!(0, combined.keys.len());
     }
 }

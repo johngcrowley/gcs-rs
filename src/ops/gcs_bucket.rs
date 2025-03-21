@@ -84,16 +84,56 @@ impl GCSBucket {
         let mut cancel = std::pin::pin!(cancel.cancelled());
 
         for path in paths {
-            delete_objects.push(match &self.prefix_in_bucket {
-                Some(prefix) => self.bucket_name.clone() + &prefix.clone() + "/" + path,
-                None => self.bucket_name.clone() + "/" + path,
-            });
+            delete_objects.push(path);
+            //delete_objects.push(match &self.prefix_in_bucket {
+            //    Some(prefix) => self.bucket_name.clone() + &prefix.clone() + "/" + path,
+            //    None => self.bucket_name.clone() + "/" + path,
+            //});
         }
 
-        // Main request: "Content-Type: multipart/mixed"
-        // Nested requests: "Content-Type: application/http"
+        let mut bulk_vec: Vec<String> = vec![];
+        for (index, path_to_delete) in delete_objects.iter().enumerate() {
+            // Part Headers
+            let prt_hdr = format!("Content-Type: application/http\r\nContent-Transfer-Encoding: binary\r\nContent-ID: {}\r\n", index);
 
-        let res = Client::new();
+            // Nested requests:
+            let part_req_del = format!(
+                "DELETE {}/o/object{}\r\n",
+                &self.bucket_name, path_to_delete
+            );
+            let part_req_hdr = "Content-Type: application/json\r\naccept: application/json\r\n";
+
+            bulk_vec.push("--===============457==\r\n".to_string());
+            bulk_vec.push(prt_hdr);
+            bulk_vec.push(part_req_del);
+            bulk_vec.push(part_req_hdr.to_string());
+        }
+
+        bulk_vec.push("--===============457==--".to_string());
+        let body = bulk_vec.join("");
+
+        let content_length = bulk_vec.len().to_string();
+
+        // Main request: "Content-Type: multipart/mixed"
+        let bulk_delete_uri = "POST /batch/storage/v1 HTTP/1.1\r\nHost: storage.googleapis.com";
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_str(&content_length).unwrap(),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("multipart/mixed; boundary=\"===============457==\""),
+        );
+        //let res = Client::new()
+        //    .post(bulk_delete_uri)
+        //    .headers(headers)
+        //    .bearer_auth(self.token_provider.token(SCOPES).await?.as_str())
+        //    .body(body)
+        //    .build();
+
+        println!("{}", body);
 
         Ok(())
     }

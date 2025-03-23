@@ -26,6 +26,7 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::sync::CancellationToken;
 use types::{DownloadError, Listing, ListingObject};
 use url::Url;
+use uuid::Uuid;
 
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
 
@@ -84,56 +85,82 @@ impl GCSBucket {
         let mut cancel = std::pin::pin!(cancel.cancelled());
 
         for path in paths {
-            delete_objects.push(path);
+            let encoded_path: String =
+                url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+            delete_objects.push(encoded_path);
             //delete_objects.push(match &self.prefix_in_bucket {
             //    Some(prefix) => self.bucket_name.clone() + &prefix.clone() + "/" + path,
             //    None => self.bucket_name.clone() + "/" + path,
             //});
         }
 
-        let mut bulk_vec: Vec<String> = vec![];
+        let mut form = reqwest::multipart::Form::new();
+        let bulk_uri = "https://storage.googleapis.com/batch/storage/v1";
+
         for (index, path_to_delete) in delete_objects.iter().enumerate() {
-            // Part Headers
-            let prt_hdr = format!("Content-Type: application/http\r\nContent-Transfer-Encoding: binary\r\nContent-ID: {}\r\n", index);
+            let delete_req = format!(
+                "
+                DELETE /storage/v1/b/acrelab-production-us1c-transfer/o/{} HTTP/1.1\r\n\
+                Content-Type: application/json\r\n\
+                accept: application/json\r\n\
+                content-length: 0\r\n
+                ",
+                path_to_delete
+            )
+            .trim()
+            .to_string();
 
-            // Nested requests:
-            let part_req_del = format!(
-                "DELETE {}/o/object{}\r\n",
-                &self.bucket_name, path_to_delete
+            println!(
+                "Trying to delete: {} in bucket: {}",
+                path_to_delete, self.bucket_name
             );
-            let part_req_hdr = "Content-Type: application/json\r\naccept: application/json\r\n";
 
-            bulk_vec.push("--===============457==\r\n".to_string());
-            bulk_vec.push(prt_hdr);
-            bulk_vec.push(part_req_del);
-            bulk_vec.push(part_req_hdr.to_string());
+            //println!("Delete request: \n{}", delete_req);
+
+            let content_id = format!("<{}+{}>", Uuid::new_v4(), index + 1);
+
+            let mut part_headers = header::HeaderMap::new();
+            part_headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/http"),
+            );
+            part_headers.insert(
+                header::TRANSFER_ENCODING,
+                header::HeaderValue::from_static("binary"),
+            );
+            part_headers.insert(
+                header::HeaderName::from_static("content-id"),
+                header::HeaderValue::from_str(&content_id)?,
+            );
+            let part = reqwest::multipart::Part::text(delete_req).headers(part_headers);
+
+            form = form.part(format!("request-{}", index), part);
         }
 
-        bulk_vec.push("--===============457==--".to_string());
-        let body = bulk_vec.join("");
-
-        let content_length = bulk_vec.len().to_string();
-
-        // Main request: "Content-Type: multipart/mixed"
-        let bulk_delete_uri = "POST /batch/storage/v1 HTTP/1.1\r\nHost: storage.googleapis.com";
+        println!("{:?}", form.boundary());
 
         let mut headers = header::HeaderMap::new();
         headers.insert(
-            header::CONTENT_LENGTH,
-            header::HeaderValue::from_str(&content_length).unwrap(),
-        );
-        headers.insert(
             header::CONTENT_TYPE,
-            header::HeaderValue::from_static("multipart/mixed; boundary=\"===============457==\""),
+            header::HeaderValue::from_str(&format!(
+                "multipart/mixed; boundary={}",
+                form.boundary()
+            ))?,
         );
-        //let res = Client::new()
-        //    .post(bulk_delete_uri)
-        //    .headers(headers)
-        //    .bearer_auth(self.token_provider.token(SCOPES).await?.as_str())
-        //    .body(body)
-        //    .build();
 
-        println!("{}", body);
+        let res = Client::new()
+            .post(bulk_uri)
+            .bearer_auth(self.token_provider.token(SCOPES).await?.as_str())
+            .multipart(form)
+            .headers(headers)
+            .send()
+            .await?;
+
+        println!("{:?}", res.status());
+
+        let body = res.text().await?;
+
+        println!("{body}");
 
         Ok(())
     }

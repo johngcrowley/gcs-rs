@@ -97,7 +97,11 @@ impl GCSBucket {
         let mut form = reqwest::multipart::Form::new();
         let bulk_uri = "https://storage.googleapis.com/batch/storage/v1";
 
+        let mut logger = HashMap::new();
+
         for (index, path_to_delete) in delete_objects.iter().enumerate() {
+            logger.insert(index + 1, false);
+
             let delete_req = format!(
                 "
                 DELETE /storage/v1/b/acrelab-production-us1c-transfer/o/{} HTTP/1.1\r\n\
@@ -156,11 +160,72 @@ impl GCSBucket {
             .send()
             .await?;
 
-        println!("{:?}", res.status());
+        if !res.status().is_success() {
+            return Err(anyhow::anyhow!("stuff happened"));
+        }
 
-        let body = res.text().await?;
+        // I have to do this "owning" first
+        // https://users.rust-lang.org/t/creates-a-temporary-which-is-freed-while-still-in-use-again/29211/2
+        // -> else, i'm creating a heap object then returning a referene to it with `to_str` or
+        //   `get`, before it's tethered. Like I've built a home without a foundation. It gets
+        //   washed away into the sea...
+        let res_headers = res.headers().to_owned();
 
-        println!("{body}");
+        let boundary = res_headers
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()?
+            .split("=")
+            .last()
+            .unwrap();
+
+        println!("{}", boundary);
+
+        println!("---");
+
+        let res_body = res.text().await?;
+
+        let parsed: HashMap<String, String> = res_body
+            .split(&format!("--{}", boundary))
+            // only keep these things, and do stuff to them on the way.
+            .filter_map(|c| {
+                // mutable because 'find_map' requires mutable self.
+                let mut lines = c.lines();
+
+                let id = lines
+                    // .find() is: look for this static pattern and give me Some(index) or None.
+                    // .find_map():
+                    //      1. do all this stuff
+                    //      2. return the first non-None result
+                    .find_map(|line| {
+                        line
+                            // may give me all Nones, else, Some(everything-after-prefix)
+                            .strip_prefix("Content-ID:")
+                            // takes the Option<> and returns a new Some(),
+                            // or stops at the None it gets.
+                            .and_then(|suf| suf.split('+').last())
+                            // return a new Some()
+                            .and_then(|suf| suf.split('>').next())
+                            // trim() and to_string() can't fail (don't return Option<>)
+                            // so might as well use it.
+                            // -> we could also return
+                            .map(|x| x.trim().to_string())
+                    });
+
+                let status_code = lines.find_map(|line| {
+                    line.strip_prefix("HTTP/1.1")
+                        .and_then(|x| x.split_whitespace().next())
+                        .map(|x| x.trim().to_string())
+                });
+
+                id.zip(status_code)
+            })
+            .collect();
+
+        for (id, code) in parsed.iter() {
+            println!("content-id: {}: status_code: {}", id, code);
+            println!("---");
+        }
 
         Ok(())
     }

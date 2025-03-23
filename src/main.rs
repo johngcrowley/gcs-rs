@@ -34,6 +34,17 @@ async fn main() -> Result<()> {
     // --- Bearer Token: ---
     //println!("{:?}", gcs.token_provider.token(SCOPES).await?.as_str());
 
+    // --- Bulk Delete: ---
+    let cancel = CancellationToken::new();
+    let paths = [
+        "cdl/mri/year/2015/core-1",
+        "cdl/mri/year/2015/core-2",
+        "cdl/mri/year/2015/core-3",
+    ];
+    gcs.delete_objects(&paths, &cancel).await?;
+
+    return Ok(());
+
     // --- Upload: ---
     let source_file =
         tokio::fs::File::open("/home/john/code/rust/gcs-rs/src/tests/nullbytes").await?;

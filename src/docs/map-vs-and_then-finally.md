@@ -1,3 +1,4 @@
+
 `map`'s _closure_ returns just the type, but map itself will wrap.
 so if you chained maps on just `x*2`
 -  The closure is explicitly responsible for handling the potential for failure and

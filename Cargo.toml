@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.95"
 async-stream = "0.3.6"
+azure_core = "0.22.0"
 bytes = "1.10.0"
 chrono = "0.4.40"
 clap = "4.5.26"
@@ -13,9 +14,12 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 gcp_auth = "0.12.3"
 http = "1.2.0"
-reqwest = { version = "0.12.12", features = ["stream"] }
+regex = "1.11.1"
+reqwest = { version = "0.12.12", features = ["stream", "multipart"] }
 serde = "1.0.217"
 serde_derive = "1.0.217"
 serde_json = "1.0.138"
 tokio = { version = "1.43.0", features = ["full", "io-util"] }
 tokio-util = { version = "0.7.13", features = ["codec"] }
+url = "2.5.4"
+uuid = "1.16.0"

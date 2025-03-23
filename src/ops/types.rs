@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap as Map;
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -23,7 +23,7 @@ pub struct GCSObject {
     pub storage_class: String,
     pub size: Option<String>,
     #[serde(rename = "md5Hash")]
-    pub md5_hash: String,
+    pub md5_hash: Option<String>,
     pub crc32c: String,
     pub etag: String,
     #[serde(rename = "timeCreated")]
@@ -33,7 +33,7 @@ pub struct GCSObject {
     pub time_storage_class_updated: String,
     #[serde(rename = "timeFinalized")]
     pub time_finalized: String,
-    pub metadata: Option<Map<String, String>>,
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 impl GCSListResponse {
@@ -45,7 +45,7 @@ impl GCSListResponse {
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct ListingObject {
     pub key: String,
-    pub last_modified: String,
+    pub last_modified: SystemTime,
     pub size: u64,
 }
 

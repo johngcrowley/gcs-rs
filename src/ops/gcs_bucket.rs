@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::sync::CancellationToken;
+use tracing;
 use types::{DownloadError, Listing, ListingObject};
 use url::Url;
 use uuid::Uuid;
@@ -59,6 +60,8 @@ impl GCSBucket {
             .bearer_auth(self.token_provider.token(SCOPES).await?.as_str())
             .send()
             .await?;
+
+        println!("{:?}", res);
 
         Ok(())
     }
@@ -97,11 +100,9 @@ impl GCSBucket {
         let mut form = reqwest::multipart::Form::new();
         let bulk_uri = "https://storage.googleapis.com/batch/storage/v1";
 
-        let mut logger = HashMap::new();
+        let mut delete_objects_status = HashMap::new();
 
         for (index, path_to_delete) in delete_objects.iter().enumerate() {
-            logger.insert(index + 1, false);
-
             let delete_req = format!(
                 "
                 DELETE /storage/v1/b/acrelab-production-us1c-transfer/o/{} HTTP/1.1\r\n\
@@ -122,6 +123,8 @@ impl GCSBucket {
             //println!("Delete request: \n{}", delete_req);
 
             let content_id = format!("<{}+{}>", Uuid::new_v4(), index + 1);
+
+            delete_objects_status.insert(index + 1, path_to_delete.clone());
 
             let mut part_headers = header::HeaderMap::new();
             part_headers.insert(
@@ -221,6 +224,37 @@ impl GCSBucket {
                 id.zip(status_code)
             })
             .collect();
+
+        // Gather failures
+        let errors: HashMap<usize, &String> = parsed
+            .iter()
+            .filter_map(|(x, y)| {
+                let horst = x.chars().next();
+                println!("{:?}", horst);
+                if horst != Some('2') {
+                    x.parse::<usize>().ok().map(|v| (v, y))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        println!("delete_oids result: {:?}", &errors);
+
+        // Report 10 of them like S3
+        const LOG_UP_TO_N_ERRORS: usize = 10;
+        for (id, code) in errors.iter().take(LOG_UP_TO_N_ERRORS) {
+            println!("checking id {:?} ...", id);
+
+            println!("checking our hashmap... {:?} ...", delete_objects_status);
+
+            println!(
+                "DeleteObjects key {} failed with code: {}",
+                delete_objects_status.get(id).unwrap(),
+                code
+            );
+        }
+        println!("hello");
 
         for (id, code) in parsed.iter() {
             println!("content-id: {}: status_code: {}", id, code);

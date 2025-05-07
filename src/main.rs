@@ -34,34 +34,32 @@ async fn main() -> Result<()> {
     // --- Bearer Token: ---
     //println!("{:?}", gcs.token_provider.token(SCOPES).await?.as_str());
 
-    // --- Bulk Delete: ---
-    let cancel = CancellationToken::new();
-    let paths = [
-        "cdl/mri/year/2015/core-1",
-        "cdl/mri/year/2015/core-2",
-        "cdl/mri/year/2015/core-3",
-    ];
-    gcs.delete_objects(&paths, &cancel).await?;
+    //// --- Upload: ---
+    //let source_file =
+    //    tokio::fs::File::open("/home/john/code/rust/gcs-rs/src/tests/nullbytes").await?;
+    //let fs_size = usize::try_from(source_file.metadata().await?.len())?;
+    //let gcs_uri = "https://storage.googleapis.com/upload/storage/v1/b/acrelab-production-us1c-transfer/o/?uploadType=media&name=blinko/nullbytes";
+    //let reader = tokio_util::io::ReaderStream::with_capacity(source_file, BUFFER_SIZE);
+    //let res = gcs.upload(reader, fs_size, gcs_uri).await?;
+    //println!("{:?}", res);
 
-    return Ok(());
+    //// --- Bulk Delete: ---
+    //let cancel = CancellationToken::new();
+    //let paths = ["blinko/nullbytes"];
+    //gcs.delete_objects(&paths, &cancel).await?;
 
-    // --- Upload: ---
-    let source_file =
-        tokio::fs::File::open("/home/john/code/rust/gcs-rs/src/tests/nullbytes").await?;
-    let fs_size = usize::try_from(source_file.metadata().await?.len())?;
-    let gcs_uri = "https://storage.googleapis.com/upload/storage/v1/b/acrelab-production-us1c-transfer/o?uploadType=media&name=nullbytes";
-    let reader = tokio_util::io::ReaderStream::with_capacity(source_file, BUFFER_SIZE);
-    gcs.upload(reader, fs_size, gcs_uri).await?;
+    //return Ok(());
 
     // --- Download: ---
     let cancel = CancellationToken::new();
-    let remote_prefix = "bonk.geojson".to_string();
+    let remote_prefix = "neon%2Fpageserver%2Ftenants%2F99336152a31c64b41034e4e904629ce9%2Ftenant-manifest-00000001.json".to_string();
     use futures::stream::StreamExt;
     let downloads = gcs.download_object(remote_prefix, &cancel).await?;
     let mut stream = std::pin::pin!(downloads.download_stream);
     while let Some(item) = stream.next().await {
         println!("{:?}", item);
     }
+    return Ok(());
 
     // --- List: ---
     // let cancel = CancellationToken::new();

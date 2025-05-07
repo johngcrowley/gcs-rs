@@ -8,6 +8,7 @@ pub struct GCSListResponse {
     #[serde(rename = "nextPageToken")]
     pub next_page_token: Option<String>,
     pub items: Option<Vec<GCSObject>>,
+    pub prefixes: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -18,7 +19,7 @@ pub struct GCSObject {
     pub generation: String,
     pub metageneration: String,
     #[serde(rename = "contentType")]
-    pub content_type: String,
+    pub content_type: Option<String>,
     #[serde(rename = "storageClass")]
     pub storage_class: String,
     pub size: Option<String>,
